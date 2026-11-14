@@ -68,6 +68,17 @@ void Host::forceStretch(StretchOption newStretch) {
 
 
 
+// After a save state loads: presses not yet seen by the cart belong to the
+// moment that was left, and the held buttons are the state's.
+void loadInputState(const uint8_t kHeld[8]) {
+    stubCurrKDown = 0;
+    stubCurrKHeld = kHeld[0];
+    for (int p = 0; p < 7; p++) {
+        stubPDown[p] = 0;
+        stubPHeld[p] = kHeld[p + 1];
+    }
+}
+
 void setPlayerInputState(int player, uint8_t kDown, uint8_t kHeld) {
     if (player < 1 || player > 7) return;
     stubPDown[player - 1] |= kDown;

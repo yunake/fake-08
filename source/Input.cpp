@@ -1,3 +1,4 @@
+#include <cstring>
 #include <algorithm>
 
 #include "Input.h"
@@ -12,6 +13,16 @@ Input::Input(PicoRam* memory):
     std::fill(&_currentKDown[0], &_currentKDown[0] + 8, 0);
     std::fill(&_currentKHeld[0], &_currentKHeld[0] + 8, 0);
     std::fill(&_framesHeld[0][0], &_framesHeld[0][0] + 64, 0);
+}
+
+void Input::SaveHeld(uint8_t kheld[8], uint16_t framesHeld[8][8]){
+    memcpy(kheld, _currentKHeld, sizeof(_currentKHeld));
+    memcpy(framesHeld, _framesHeld, sizeof(_framesHeld));
+}
+
+void Input::LoadHeld(const uint8_t kheld[8], const uint16_t framesHeld[8][8]){
+    memcpy(_currentKHeld, kheld, sizeof(_currentKHeld));
+    memcpy(_framesHeld, framesHeld, sizeof(_framesHeld));
 }
 
 void Input::SetFrameScale(uint8_t scale){

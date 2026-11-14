@@ -341,7 +341,9 @@ eris.original_G = {}
 eris.init_persist_all = function()
   -- lua pairs is not sorted. The order is actually random, changes on every execution (wtf?)
   
-  eris.settings("path", true)
+  -- "path" only names objects in error messages and costs time on every
+  -- save state and rewind step
+  eris.settings("path", false)
   
   local keyset={}
   local n=0
@@ -375,6 +377,10 @@ eris.restore_all = function(persisted)
   local new_symbols = eris.unpersist(eris.unperm, persisted)
   for k,v in pairs(new_symbols) do
     _G[k] = v
+  end
+  -- C code reaches the cart's globals through this (when _ENV changes)
+  if __cart_sandbox then
+    rawset(debug.getregistry(), "__PICO8_SANDBOX", __cart_sandbox)
   end
 end
 

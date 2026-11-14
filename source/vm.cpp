@@ -170,18 +170,20 @@ bool _initializeLuaState(lua_State* luaState) {
     // Push the eris.init_persist_all function on the top of the lua stack (or nil if it doesn't exist)
     // we call this function to establish the default global state of things not to save in the save state
     // needs to be called after globals are loaded but before the cart is run, or _init is called
-    //TODO: move these calls to the glue code?
-    // lua_getglobal(luaState, "eris");
-	// lua_getfield(luaState, -1, "init_persist_all");
+    // Without it nothing the BIOS defines (the API's C functions) can be
+    // persisted, so every save state held RAM but no Lua state.
+    lua_getglobal(luaState, "eris");
+	lua_getfield(luaState, -1, "init_persist_all");
 
-    // if (lua_pcall(luaState, 0, 0, 0)){
-    //     Logger_Write("Error setting up lua persistence: %s\n", lua_tostring(luaState, -1));
-    //     lua_pop(luaState, 1);
-    //     return false;
-    // }
-
-    // //pop the eris.init_persist_all fuction off the stack now that we're done with it
-    // lua_pop(luaState, 1);
+    if (lua_pcall(luaState, 0, 0, 0)){
+        Logger_Write("Error setting up lua persistence: %s\n", lua_tostring(luaState, -1));
+        // the cart still plays, only its save states are not possible
+        lua_pop(luaState, 2);
+    }
+    else {
+        //pop the eris table now that we're done with it
+        lua_pop(luaState, 1);
+    }
 
 
     return true;
@@ -611,6 +613,34 @@ void Vm::deserializeCartDataToMemory(std::string cartDataStr) {
     }
 }
 
+// Load a queued cart now. libretro calls it from retro_load_game too, so a
+// save state loaded before the first frame finds the cart running.
+void Vm::ProcessQueuedCartChange() {
+    // Process any queued cart change (from reset, load, etc.)
+    if (_cartChangeQueued) {
+        Logger_Write("Processing cart change, _pauseMenu = %s\n", _pauseMenu ? "true" : "false");
+        _prevCartKey = CurrentCartFilename();
+        if (_nextCartSize > 0){
+            LoadCart(_nextCartData, _nextCartSize);
+        }
+        else {
+            LoadCart(_nextCartKey);
+        }
+        // Only run if cart loaded successfully (has Lua code)
+        if (_loadedCart && !_loadedCart->LuaString.empty()) {
+            Logger_Write("Before vm_run, _pauseMenu = %s\n", _pauseMenu ? "true" : "false");
+            vm_run();
+            Logger_Write("After vm_run, _pauseMenu = %s\n", _pauseMenu ? "true" : "false");
+        }
+        else {
+            Logger_Write("Cart load failed, not running vm_run()\n");
+            // Clear cart change queue to prevent infinite retry loop
+            _cartChangeQueued = false;
+        }
+    }
+
+}
+
 bool Vm::Step(){
     _picoFrameCount++;
     bool ret = false;
@@ -638,28 +668,7 @@ bool Vm::Step(){
     }
     lua_pop(_luaState, 1);
 
-    // Process any queued cart change (from reset, load, etc.)
-    if (_cartChangeQueued) {
-        Logger_Write("Processing cart change, _pauseMenu = %s\n", _pauseMenu ? "true" : "false");
-        _prevCartKey = CurrentCartFilename();
-        if (_nextCartSize > 0){
-            LoadCart(_nextCartData, _nextCartSize);
-        }
-        else {
-            LoadCart(_nextCartKey);
-        }
-        // Only run if cart loaded successfully (has Lua code)
-        if (_loadedCart && !_loadedCart->LuaString.empty()) {
-            Logger_Write("Before vm_run, _pauseMenu = %s\n", _pauseMenu ? "true" : "false");
-            vm_run();
-            Logger_Write("After vm_run, _pauseMenu = %s\n", _pauseMenu ? "true" : "false");
-        }
-        else {
-            Logger_Write("Cart load failed, not running vm_run()\n");
-            // Clear cart change queue to prevent infinite retry loop
-            _cartChangeQueued = false;
-        }
-    }
+    ProcessQueuedCartChange();
 
     return ret;
 }
@@ -799,6 +808,17 @@ std::string Vm::CurrentCartFilename(){
     }
 
     return "";
+}
+
+void Vm::SaveVmState(vmSaveState_t* state) {
+    memset(state, 0, sizeof(vmSaveState_t));
+    state->frameCount = _picoFrameCount;
+    _input->SaveHeld(state->kHeld, state->framesHeld);
+}
+
+void Vm::LoadVmState(const vmSaveState_t* state) {
+    _picoFrameCount = state->frameCount;
+    _input->LoadHeld(state->kHeld, state->framesHeld);
 }
 
 int Vm::GetFrameCount() {
@@ -1500,34 +1520,49 @@ std::string Vm::getLuaLine(string filename, int linenumber) {
 }
 
 
-size_t Vm::serializeLuaState(char* dest) {
+// eris builds objects that nothing references yet; a collection in the
+// middle of (un)persisting frees them (use-after-free, seen with ASan), so
+// the collector waits until it is done.
+size_t Vm::serializeLuaState(char* dest, size_t capacity) {
+    lua_gc(_luaState, LUA_GCSTOP, 0);
     lua_getglobal(_luaState, "eris");
 	lua_getfield(_luaState, -1, "persist_all");
 
 	if (lua_pcall(_luaState, 0, 1, 0) != 0) {
-		std::string e = lua_tostring(_luaState, -1);
-		lua_pop(_luaState, 1);
+		Logger_Write("persist failed: %s\n", lua_tostring(_luaState, -1));
+		lua_pop(_luaState, 2);
+		lua_gc(_luaState, LUA_GCRESTART, 0);
 		return 0;
 	}
 
 	size_t len;
 	const char* result = lua_tolstring(_luaState, -1, &len);
-    memcpy(dest, result, len);
+	if (len > capacity) {
+		// bigger than a save state holds: no Lua state, never a overflow
+		len = 0;
+	}
+	else {
+		memcpy(dest, result, len);
+	}
 	lua_pop(_luaState, 2);
+	lua_gc(_luaState, LUA_GCRESTART, 0);
 
     return len;
 }
 
-void Vm::deserializeLuaState(const char* src, size_t len) {
+bool Vm::deserializeLuaState(const char* src, size_t len) {
+    lua_gc(_luaState, LUA_GCSTOP, 0);
     lua_getglobal(_luaState, "eris");
 	lua_getfield(_luaState, -1, "restore_all");
 	lua_pushlstring(_luaState, src, len);
 
-	if (lua_pcall(_luaState, 1, 0, 0) != 0) {
-		std::string e = lua_tostring(_luaState, -1);
+	bool ok = lua_pcall(_luaState, 1, 0, 0) == 0;
+	if (!ok) {
+		Logger_Write("unpersist failed: %s\n", lua_tostring(_luaState, -1));
 		lua_pop(_luaState, 1);
-		return;
 	}
 	lua_pop(_luaState, 1);
+	lua_gc(_luaState, LUA_GCRESTART, 0);
+	return ok;
 }
 

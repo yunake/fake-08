@@ -18,6 +18,18 @@ using namespace std;
 
 using namespace z8;
 
+// What the VM keeps outside PICO-8 RAM and the Lua state; part of a save
+// state. Without the frame count, time() jumps on load and timed carts
+// (title banners, animations) show a different moment than was saved.
+struct vmSaveState_t {
+    int32_t frameCount;
+    uint8_t kHeld[8];
+    uint16_t framesHeld[8][8];
+    // the host's own frame counter: libretro mixes sound every other frame,
+    // so music only advances in step on two consoles with the same one
+    uint32_t hostFrame;
+};
+
 class Vm {
     Host* _host;
     PicoRam* _memory;
@@ -93,6 +105,9 @@ class Vm {
     int GetTargetFps();
 
     int GetFrameCount();
+    void ProcessQueuedCartChange();
+    void SaveVmState(vmSaveState_t* state);
+    void LoadVmState(const vmSaveState_t* state);
 
     void GameLoop();
 
@@ -174,7 +189,7 @@ class Vm {
     string getCartBreadcrumb();
     string getCartParam();
 
-    size_t serializeLuaState(char* dest);
-    void deserializeLuaState(const char* src, size_t len);
+    size_t serializeLuaState(char* dest, size_t capacity);
+    bool deserializeLuaState(const char* src, size_t len);
 };
 

@@ -537,216 +537,164 @@ EXPORT size_t retro_serialize_size()
     sizeof(size_t) + sizeof(PicoRam) + 
     //size plus audio state
     sizeof(size_t) + sizeof(audioState_t) + 
+    //size plus the vm's own state (clock, held buttons)
+    sizeof(size_t) + sizeof(vmSaveState_t) +
     //size plus lua state
     sizeof(size_t) + LUASTATEBUFFSIZE;
 }
 
+#include <cstddef>
 #define SAVE_STATE_HEADER_SIZE 4
 
+// Version 2: header, RAM, audio, the VM's clock and held buttons,
+// then the Lua state, so everything but the Lua state sits at the same offset
+// in every state and rewind deltas stay small. The sfx channels' reverb
+// buffers stay out: they only colour the sound and change every sample.
+// Versions 1 (Lua state first, music only) and the legacy headerless layout
+// still load.
+static void clear_reverb(audioState_t* audio) {
+    for (int i = 0; i < 4; i++) {
+        audio->_sfxChannels[i].reverb_index = 0;
+        memset(audio->_sfxChannels[i].reverb_2, 0, sizeof(audio->_sfxChannels[i].reverb_2));
+        memset(audio->_sfxChannels[i].reverb_4, 0, sizeof(audio->_sfxChannels[i].reverb_4));
+    }
+}
 EXPORT bool retro_serialize(void *data, size_t size)
 {
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "retro_serialize. Checking size\n");
-    }
     const size_t expectedSize = retro_serialize_size();
-    if (size > expectedSize) {
-        size = expectedSize;
-    }
-    else if (size < expectedSize) {
+    if (size < expectedSize) {
         return false;
     }
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "got size %d\n", size);
-    }
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "setting up lua state buffer\n");
-    }
-    char headerBuffer[SAVE_STATE_HEADER_SIZE] = {'f', '8', 0, 1};
-    memcpy((char*)data, &headerBuffer, SAVE_STATE_HEADER_SIZE);
-    
-    memset(luaStateBuffer, 0, LUASTATEBUFFSIZE);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "serializing lua state\n");
-    }
+    char* out = (char*)data;
+    memset(out, 0, expectedSize);
+    const char header[SAVE_STATE_HEADER_SIZE] = {'f', '8', 0, 2};
+    memcpy(out, header, SAVE_STATE_HEADER_SIZE);
     size_t offset = SAVE_STATE_HEADER_SIZE;
-    size_t luaStateSize = _vm->serializeLuaState(luaStateBuffer);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "copying lua state size to buffer\n");
-    }
-    memcpy(((char*)data + offset), &luaStateSize, sizeof(size_t));
-    offset += sizeof(size_t);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "copying lua state to buffer\n");
-    }
-
-    memcpy(((char*)data + offset), luaStateBuffer, luaStateSize);
-    offset += luaStateSize;
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "copying pico 8 memory to buffer\n");
-    }
 
     size_t picoRamSize = sizeof(PicoRam);
-    memcpy(((char*)data + offset), &picoRamSize, sizeof(size_t));
+    memcpy(out + offset, &picoRamSize, sizeof(size_t));
     offset += sizeof(size_t);
-
-    memcpy(((char*)data + offset), _memory->data, sizeof(PicoRam));
+    memcpy(out + offset, _memory->data, sizeof(PicoRam));
     offset += sizeof(PicoRam);
 
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "copying audio state size to buffer\n");
-    }
-
-    size_t musicChannelSize = sizeof(musicChannel);
-    memcpy(((char*)data + offset), &musicChannelSize, sizeof(size_t));
+    size_t audioSize = sizeof(audioState_t);
+    memcpy(out + offset, &audioSize, sizeof(size_t));
     offset += sizeof(size_t);
+    audioState_t* audio = (audioState_t*)(out + offset);
+    memcpy(audio, _audio->getAudioState(), sizeof(audioState_t));
+    clear_reverb(audio);
+    offset += sizeof(audioState_t);
 
-    memcpy(((char*)data + offset), &_audio->getAudioState()->_musicChannel, sizeof(musicChannel));
-    offset += sizeof(musicChannel);
+    size_t vmSize = sizeof(vmSaveState_t);
+    memcpy(out + offset, &vmSize, sizeof(size_t));
+    offset += sizeof(size_t);
+    vmSaveState_t vmState;
+    _vm->SaveVmState(&vmState);
+    vmState.hostFrame = (uint32_t)frame;
+    memcpy(out + offset, &vmState, sizeof(vmSaveState_t));
+    offset += sizeof(vmSaveState_t);
 
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "returning true\n");
+    size_t luaStateSize = _vm->serializeLuaState(out + offset + sizeof(size_t), LUASTATEBUFFSIZE);
+    if (luaStateSize == 0) {
+        // a state without the cart's Lua state would load as a broken game
+        return false;
     }
-
+    memcpy(out + offset, &luaStateSize, sizeof(size_t));
     return true;
 }
 
+static bool read_size(const char* in, size_t size, size_t& offset, size_t& value) {
+    if (offset + sizeof(size_t) > size) return false;
+    memcpy(&value, in + offset, sizeof(size_t));
+    offset += sizeof(size_t);
+    return true;
+}
 
 bool deserialize_legacy(const void *data, size_t size) {
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "LEGACY lua deserialize LEGACY\n");
-    }
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "LEGACY setting up lua state buffer\n");
-    }
-    memset(luaStateBuffer, 0, LUASTATEBUFFSIZE);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "LEGACY copying lua state from buffer to var\n");
-    }
+    const char* in = (const char*)data;
     size_t offset = 0;
     size_t luaStateSize;
-    memcpy(&luaStateSize, ((char*)data + offset),  sizeof(size_t));
-    offset += sizeof(size_t);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "LEGACY got lua state size %d\n", luaStateSize);
-    }
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "LEGACY copying lua state\n");
-    }
-
-    memcpy(luaStateBuffer, ((char*)data + offset), luaStateSize);
+    if (!read_size(in, size, offset, luaStateSize)) return false;
+    if (luaStateSize > LUASTATEBUFFSIZE || offset + luaStateSize + sizeof(PicoRam) + sizeof(musicChannel) > size) return false;
+    memcpy(luaStateBuffer, in + offset, luaStateSize);
     offset += luaStateSize;
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "LEGACY deserializing lua state\n");
-    }
-    _vm->deserializeLuaState(luaStateBuffer, luaStateSize);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "LEGACY copying pico 8 memory\n");
-    }
-
-    memcpy(_memory->data, ((char*)data + offset), sizeof(PicoRam));
+    if (!_vm->deserializeLuaState(luaStateBuffer, luaStateSize)) return false;
+    memcpy(_memory->data, in + offset, sizeof(PicoRam));
     offset += sizeof(PicoRam);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "LEGACY copying audio state\n");
-    }
-
-    memcpy(&_audio->getAudioState()->_musicChannel, ((char*)data + offset), sizeof(musicChannel));
-    offset += sizeof(audioState_t);
-    
+    memcpy(&_audio->getAudioState()->_musicChannel, in + offset, sizeof(musicChannel));
     return true;
 }
 
+static bool deserialize_v1(const char* in, size_t size) {
+    size_t offset = SAVE_STATE_HEADER_SIZE;
+    size_t luaStateSize, picoRamSize, musicChannelSize;
+    if (!read_size(in, size, offset, luaStateSize)) return false;
+    if (luaStateSize == 0 || luaStateSize > LUASTATEBUFFSIZE || offset + luaStateSize > size) return false;
+    memcpy(luaStateBuffer, in + offset, luaStateSize);
+    offset += luaStateSize;
+    if (!read_size(in, size, offset, picoRamSize) || picoRamSize != sizeof(PicoRam) || offset + picoRamSize > size) return false;
+    const char* ram = in + offset;
+    offset += picoRamSize;
+    if (!read_size(in, size, offset, musicChannelSize) || musicChannelSize != sizeof(musicChannel) || offset + musicChannelSize > size) return false;
+    if (!_vm->deserializeLuaState(luaStateBuffer, luaStateSize)) return false;
+    memcpy(_memory->data, ram, picoRamSize);
+    memcpy(&_audio->getAudioState()->_musicChannel, in + offset, musicChannelSize);
+    return true;
+}
+
+static bool deserialize_v2(const char* in, size_t size) {
+    size_t offset = SAVE_STATE_HEADER_SIZE;
+    size_t picoRamSize, audioSize, vmSize, luaStateSize;
+    if (!read_size(in, size, offset, picoRamSize) || picoRamSize != sizeof(PicoRam) || offset + picoRamSize > size) return false;
+    const char* ram = in + offset;
+    offset += picoRamSize;
+    if (!read_size(in, size, offset, audioSize) || audioSize != sizeof(audioState_t) || offset + audioSize > size) return false;
+    const char* audio = in + offset;
+    offset += audioSize;
+    // states from before the host frame was kept are shorter by its 4 bytes
+    if (!read_size(in, size, offset, vmSize) || (vmSize != sizeof(vmSaveState_t) && vmSize != offsetof(vmSaveState_t, hostFrame)) || offset + vmSize > size) return false;
+    vmSaveState_t vmState = {};
+    memcpy(&vmState, in + offset, vmSize);
+    offset += vmSize;
+    if (!read_size(in, size, offset, luaStateSize)) return false;
+    if (luaStateSize == 0 || luaStateSize > LUASTATEBUFFSIZE || offset + luaStateSize > size) return false;
+    // Lua first: if the cart's state does not load, nothing else changes
+    if (!_vm->deserializeLuaState(in + offset, luaStateSize)) return false;
+    memcpy(_memory->data, ram, picoRamSize);
+    // the reverb buffers playing now stay: the saved ones are empty
+    audioState_t* now = _audio->getAudioState();
+    for (int i = 0; i < 4; i++) {
+        sfxChannel* to = &now->_sfxChannels[i];
+        const sfxChannel* from = &((const audioState_t*)audio)->_sfxChannels[i];
+        const size_t keep = offsetof(sfxChannel, reverb_index);
+        memcpy((char*)to, (const char*)from, keep);
+        to->damp1 = from->damp1;
+        to->damp2 = from->damp2;
+    }
+    memcpy(&now->_musicChannel, audio + offsetof(audioState_t, _musicChannel), sizeof(musicChannel));
+    _vm->LoadVmState(&vmState);
+    frame = vmState.hostFrame;
+    // a press is a button held now and not in the frame before: the frame
+    // before is the state's, so both sides of a netplay session (and
+    // a rewind) see the same presses
+    loadInputState(vmState.kHeld);
+    kHeld = vmState.kHeld[0];
+    kDown = 0;
+    for (int p = 1; p < 8; p++) playerHeld[p] = vmState.kHeld[p];
+    return true;
+}
 
 EXPORT bool retro_unserialize(const void *data, size_t size)
 {
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "lua deserialize\n");
+    const char* in = (const char*)data;
+    if (size < SAVE_STATE_HEADER_SIZE + sizeof(size_t)) {
+        return false;
     }
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "setting up lua state buffer\n");
+    if (in[0] == 'f' && in[1] == '8') {
+        if (in[3] == 2) return deserialize_v2(in, size);
+        return deserialize_v1(in, size);
     }
-    memset(luaStateBuffer, 0, LUASTATEBUFFSIZE);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "copying lua state from buffer to var\n");
-    }
-    //read header
-    char headerBuffer[SAVE_STATE_HEADER_SIZE];
-    memcpy(&headerBuffer, data, SAVE_STATE_HEADER_SIZE);
-    bool legacy = true;
-    if (headerBuffer[0] == 'f' && headerBuffer[1] == '8') {
-        legacy = false;
-    }
-
-    if (legacy) {
-        return deserialize_legacy(data, size);
-    }
-
-    size_t offset = SAVE_STATE_HEADER_SIZE;
-    size_t luaStateSize;
-    memcpy(&luaStateSize, ((char*)data + offset),  sizeof(size_t));
-    offset += sizeof(size_t);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "got lua state size %d\n", luaStateSize);
-    }
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "copying lua state\n");
-    }
-
-    memcpy(luaStateBuffer, ((char*)data + offset), luaStateSize);
-    offset += luaStateSize;
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "deserializing lua state\n");
-    }
-    _vm->deserializeLuaState(luaStateBuffer, luaStateSize);
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "copying pico 8 memory\n");
-    }
-
-    size_t picoRamSize;
-    memcpy(&picoRamSize, ((char*)data + offset),  sizeof(size_t));
-    offset += sizeof(size_t);
-
-    if (picoRamSize != sizeof(PicoRam)) {
-        log_cb(RETRO_LOG_WARN, "mismatch in expected PicoRam size\n");
-    }
-
-    memcpy(_memory->data, ((char*)data + offset), picoRamSize);
-    offset += picoRamSize;
-
-    if (log_cb) {
-        log_cb(RETRO_LOG_INFO, "copying audio state\n");
-    }
-
-    size_t musicChannelSize;
-    memcpy(&musicChannelSize, ((char*)data + offset),  sizeof(size_t));
-    offset += sizeof(size_t);
-
-    if (musicChannelSize != sizeof(musicChannel)) {
-        log_cb(RETRO_LOG_WARN, "mismatch in expected music channel size\n");
-    }
-
-    memcpy(&_audio->getAudioState()->_musicChannel, ((char*)data + offset), musicChannelSize);
-    offset += musicChannelSize;
-    
-    return true;
+    return deserialize_legacy(data, size);
 }
 
 EXPORT void retro_cheat_reset()
@@ -779,6 +727,10 @@ EXPORT bool retro_load_game(struct retro_game_info const *info)
     else {
         _vm->QueueCartChange(info->path);
     }
+
+    // Start the cart now, not on the first frame: the frontend may load a
+    // save state (resume after Save and Eject) before it runs a frame.
+    _vm->ProcessQueuedCartChange();
 
     return true;
 }

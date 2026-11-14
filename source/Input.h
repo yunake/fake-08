@@ -26,6 +26,9 @@ class Input{
     void SetState(const uint8_t* kdown, const uint8_t* kheld, int players);
     // 2 when SetState runs at 60 Hz (an _update60 cart, the pause menu)
     void SetFrameScale(uint8_t scale);
+    // held buttons and how long, for save states (btnp repeats depend on them)
+    void SaveHeld(uint8_t kheld[8], uint16_t framesHeld[8][8]);
+    void LoadHeld(const uint8_t kheld[8], const uint16_t framesHeld[8][8]);
     void SetMouse(int16_t mouseX, int16_t mouseY, uint8_t mouseBtnState);
 	
     void SetKeyboard(bool kbdown, std::string kbkey);
